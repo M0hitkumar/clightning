@@ -1,0 +1,76 @@
+FROM ubuntu:20.04
+LABEL mantainer="Vincenzo Palazzo vincenzopalazzodev@gmail.com"
+
+WORKDIR /work
+
+ENV BROCOIN_VERSION=0.20.1
+ENV CLIGHTNING_VERSION=0.10.1
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get -qq update && \
+    apt-get -qq install --no-install-recommends --allow-unauthenticated -yy \
+	autoconf \
+	automake \
+	clang \
+	cppcheck \
+	docbook-xml \
+	shellcheck \
+	eatmydata \
+	software-properties-common \
+	build-essential \
+	autoconf \
+	locales \
+	libtool \
+	libprotobuf-c-dev \
+	libsqlite3-dev \
+	libgmp-dev \
+	git \
+	python3 \
+	valgrind \
+	net-tools \
+	python3-mako \
+	python3-pip \
+	python3-setuptools \
+	python-pkg-resources \
+    python3-dev \
+    virtualenv \
+	shellcheck \
+	libxml2-utils \
+	wget \
+	gettext \
+	xsltproc \
+	zlib1g-dev && \
+	rm -rf /var/lib/apt/lists/*
+
+ENV LANGUAGE=en_US.UTF-8
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
+RUN locale-gen en_US.UTF-8 && dpkg-reconfigure locales
+
+RUN cd /tmp/ && \
+    wget https://brocoin.org/bin/brocoin-core-$BROCOIN_VERSION/brocoin-$BROCOIN_VERSION-x86_64-linux-gnu.tar.gz -O brocoin.tar.gz && \
+    tar -xvzf brocoin.tar.gz && \
+    mv /tmp/brocoin-$BROCOIN_VERSION/bin/brocoin* /usr/local/bin/ && \
+    rm -rf brocoin.tar.gz /tmp/brocoin-$BROCOIN_VERSION
+
+RUN pip3 install -U pip && \
+    pip3 install -U poetry
+
+RUN git clone https://github.com/ElementsProject/lightning.git && \
+    cd lightning && \
+    # git checkout v$CLIGHTNING_VERSION && \
+    poetry config virtualenvs.create false && \
+    poetry install && \
+    ./configure --enable-developer && \
+    make -j$(nproc)
+
+RUN mkdir lnprototest
+
+COPY . lnprototest
+
+RUN cd lnprototest && \
+    poetry config virtualenvs.create false && \
+    poetry install
+RUN cd lnprototest && ls -lha
+
+CMD ["./lnprototest/docker/entrypoint.sh"]

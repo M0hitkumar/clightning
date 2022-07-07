@@ -1,0 +1,6 @@
+These are standard brocoin manipulation routines which should be
+provided by any normal brocoin library in whatever language you choose.
+
+The ones here are standalone ones taken from brocoin core and some I
+wrote, many taken from brocoin-iterate and pasted in here.
+

@@ -1,0 +1,1061 @@
+#include "config.h"
+#include <brocoin/base58.h>
+#include <ccan/array_size/array_size.h>
+#include <ccan/cast/cast.h>
+#include <ccan/io/io.h>
+#include <ccan/pipecmd/pipecmd.h>
+#include <ccan/tal/grab_file/grab_file.h>
+#include <ccan/tal/str/str.h>
+#include <common/json_tok.h>
+#include <common/memleak.h>
+#include <errno.h>
+#include <plugins/libplugin.h>
+
+/* Brocoind's web server has a default of 4 threads, with queue depth 16.
+ * It will *fail* rather than queue beyond that, so we must not stress it!
+ *
+ * This is how many request for each priority level we have.
+ */
+#define BROCOIND_MAX_PARALLEL 4
+#define RPC_TRANSACTION_ALREADY_IN_CHAIN -27
+
+enum brocoind_prio {
+	BROCOIND_LOW_PRIO,
+	BROCOIND_HIGH_PRIO
+};
+#define BROCOIND_NUM_PRIO (BROCOIND_HIGH_PRIO+1)
+
+struct brocoind {
+	/* eg. "brocoin-cli" */
+	char *cli;
+
+	/* -datadir arg for brocoin-cli. */
+	char *datadir;
+
+	/* brocoind's version, used for compatibility checks. */
+	u32 version;
+
+	/* Is brocoind synced?  If not, we retry. */
+	bool synced;
+
+	/* How many high/low prio requests are we running (it's ratelimited) */
+	size_t num_requests[BROCOIND_NUM_PRIO];
+
+	/* Pending requests (high and low prio). */
+	struct list_head pending[BROCOIND_NUM_PRIO];
+
+	/* In flight requests (in a list for memleak detection) */
+	struct list_head current;
+
+	/* If non-zero, time we first hit a brocoind error. */
+	unsigned int error_count;
+	struct timemono first_error_time;
+
+	/* How long to keep trying to contact brocoind
+	 * before fatally exiting. */
+	u64 retry_timeout;
+
+	/* Passthrough parameters for brocoin-cli */
+	char *rpcuser, *rpcpass, *rpcconnect, *rpcport;
+
+	/* The factor to time the urgent feerate by to get the maximum
+	 * acceptable feerate. */
+	u32 max_fee_multiplier;
+
+	/* Percent of CONSERVATIVE/2 feerate we'll use for commitment txs. */
+	u64 commit_fee_percent;
+
+	/* Whether we fake fees (regtest) */
+	bool fake_fees;
+
+#if DEVELOPER
+	/* Override in case we're developer mode for testing*/
+	bool no_fake_fees;
+#endif
+};
+
+static struct brocoind *brocoind;
+
+struct brocoin_cli {
+	struct list_node list;
+	int fd;
+	int *exitstatus;
+	pid_t pid;
+	const char **args;
+	struct timeabs start;
+	enum brocoind_prio prio;
+	char *output;
+	size_t output_bytes;
+	size_t new_output;
+	struct command_result *(*process)(struct brocoin_cli *);
+	struct command *cmd;
+	/* Used to stash content between multiple calls */
+	void *stash;
+};
+
+/* Add the n'th arg to *args, incrementing n and keeping args of size n+1 */
+static void add_arg(const char ***args, const char *arg TAKES)
+{
+	if (taken(arg))
+		tal_steal(*args, arg);
+	tal_arr_expand(args, arg);
+}
+
+static const char **gather_argsv(const tal_t *ctx, const char *cmd, va_list ap)
+{
+	const char **args = tal_arr(ctx, const char *, 1);
+	const char *arg;
+
+	args[0] = brocoind->cli ? brocoind->cli : chainparams->cli;
+	if (chainparams->cli_args)
+		add_arg(&args, chainparams->cli_args);
+	if (brocoind->datadir)
+		add_arg(&args, tal_fmt(args, "-datadir=%s", brocoind->datadir));
+	if (brocoind->rpcconnect)
+		add_arg(&args,
+			tal_fmt(args, "-rpcconnect=%s", brocoind->rpcconnect));
+	if (brocoind->rpcport)
+		add_arg(&args,
+			tal_fmt(args, "-rpcport=%s", brocoind->rpcport));
+	if (brocoind->rpcuser)
+		add_arg(&args, tal_fmt(args, "-rpcuser=%s", brocoind->rpcuser));
+	if (brocoind->rpcpass)
+		add_arg(&args,
+			tal_fmt(args, "-rpcpassword=%s", brocoind->rpcpass));
+
+	add_arg(&args, cmd);
+	while ((arg = va_arg(ap, char *)) != NULL)
+		add_arg(&args, arg);
+	add_arg(&args, NULL);
+
+	return args;
+}
+
+static LAST_ARG_NULL const char **
+gather_args(const tal_t *ctx, const char *cmd, ...)
+{
+	va_list ap;
+	const char **ret;
+
+	va_start(ap, cmd);
+	ret = gather_argsv(ctx, cmd, ap);
+	va_end(ap);
+
+	return ret;
+}
+
+static struct io_plan *read_more(struct io_conn *conn, struct brocoin_cli *bcli)
+{
+	bcli->output_bytes += bcli->new_output;
+	if (bcli->output_bytes == tal_count(bcli->output))
+		tal_resize(&bcli->output, bcli->output_bytes * 2);
+	return io_read_partial(conn, bcli->output + bcli->output_bytes,
+			       tal_count(bcli->output) - bcli->output_bytes,
+			       &bcli->new_output, read_more, bcli);
+}
+
+static struct io_plan *output_init(struct io_conn *conn, struct brocoin_cli *bcli)
+{
+	bcli->output_bytes = bcli->new_output = 0;
+	bcli->output = tal_arr(bcli, char, 100);
+	return read_more(conn, bcli);
+}
+
+static void next_bcli(enum brocoind_prio prio);
+
+/* For printing: simple string of args (no secrets!) */
+static char *args_string(const tal_t *ctx, const char **args)
+{
+	size_t i;
+	char *ret = tal_strdup(ctx, args[0]);
+
+	for (i = 1; args[i]; i++) {
+		ret = tal_strcat(ctx, take(ret), " ");
+		if (strstarts(args[i], "-rpcpassword")) {
+			ret = tal_strcat(ctx, take(ret), "-rpcpassword=...");
+		} else if (strstarts(args[i], "-rpcuser")) {
+			ret = tal_strcat(ctx, take(ret), "-rpcuser=...");
+		} else {
+			ret = tal_strcat(ctx, take(ret), args[i]);
+		}
+	}
+	return ret;
+}
+
+static char *bcli_args(struct brocoin_cli *bcli)
+{
+    return args_string(bcli, bcli->args);
+}
+
+/* Only set as destructor once bcli is in current. */
+static void destroy_bcli(struct brocoin_cli *bcli)
+{
+	list_del_from(&brocoind->current, &bcli->list);
+}
+
+static void retry_bcli(void *cb_arg)
+{
+	struct brocoin_cli *bcli = cb_arg;
+	list_del_from(&brocoind->current, &bcli->list);
+	tal_del_destructor(bcli, destroy_bcli);
+
+	list_add_tail(&brocoind->pending[bcli->prio], &bcli->list);
+	next_bcli(bcli->prio);
+}
+
+/* We allow 60 seconds of spurious errors, eg. reorg. */
+static void bcli_failure(struct brocoin_cli *bcli,
+                         int exitstatus)
+{
+	struct timerel t;
+
+	if (!brocoind->error_count)
+		brocoind->first_error_time = time_mono();
+
+	t = timemono_between(time_mono(), brocoind->first_error_time);
+	if (time_greater(t, time_from_sec(brocoind->retry_timeout)))
+		plugin_err(bcli->cmd->plugin,
+		           "%s exited %u (after %u other errors) '%.*s'; "
+		           "we have been retrying command for "
+		           "--brocoin-retry-timeout=%"PRIu64" seconds; "
+		           "brocoind setup or our --brocoin-* configs broken?",
+		           bcli_args(bcli),
+		           exitstatus,
+		           brocoind->error_count,
+		           (int)bcli->output_bytes,
+		           bcli->output,
+		           brocoind->retry_timeout);
+
+	plugin_log(bcli->cmd->plugin, LOG_UNUSUAL, "%s exited with status %u",
+		   bcli_args(bcli), exitstatus);
+	brocoind->error_count++;
+
+	/* Retry in 1 second */
+	plugin_timer(bcli->cmd->plugin, time_from_sec(1), retry_bcli, bcli);
+}
+
+static void bcli_finished(struct io_conn *conn UNUSED, struct brocoin_cli *bcli)
+{
+	int ret, status;
+	struct command_result *res;
+	enum brocoind_prio prio = bcli->prio;
+	u64 msec = time_to_msec(time_between(time_now(), bcli->start));
+
+	/* If it took over 10 seconds, that's rather strange. */
+	if (msec > 10000)
+		plugin_log(bcli->cmd->plugin, LOG_UNUSUAL,
+		           "brocoin-cli: finished %s (%"PRIu64" ms)",
+		           bcli_args(bcli), msec);
+
+	assert(brocoind->num_requests[prio] > 0);
+
+	/* FIXME: If we waited for SIGCHILD, this could never hang! */
+	while ((ret = waitpid(bcli->pid, &status, 0)) < 0 && errno == EINTR);
+	if (ret != bcli->pid)
+		plugin_err(bcli->cmd->plugin, "%s %s", bcli_args(bcli),
+		           ret == 0 ? "not exited?" : strerror(errno));
+
+	if (!WIFEXITED(status))
+		plugin_err(bcli->cmd->plugin, "%s died with signal %i",
+		           bcli_args(bcli),
+		           WTERMSIG(status));
+
+	/* Implicit nonzero_exit_ok == false */
+	if (!bcli->exitstatus) {
+		if (WEXITSTATUS(status) != 0) {
+			bcli_failure(bcli, WEXITSTATUS(status));
+			brocoind->num_requests[prio]--;
+			goto done;
+		}
+	} else
+		*bcli->exitstatus = WEXITSTATUS(status);
+
+	if (WEXITSTATUS(status) == 0)
+		brocoind->error_count = 0;
+
+	brocoind->num_requests[bcli->prio]--;
+
+	res = bcli->process(bcli);
+	if (!res)
+		bcli_failure(bcli, WEXITSTATUS(status));
+	else
+		tal_free(bcli);
+
+done:
+	next_bcli(prio);
+}
+
+static void next_bcli(enum brocoind_prio prio)
+{
+	struct brocoin_cli *bcli;
+	struct io_conn *conn;
+
+	if (brocoind->num_requests[prio] >= BROCOIND_MAX_PARALLEL)
+		return;
+
+	bcli = list_pop(&brocoind->pending[prio], struct brocoin_cli, list);
+	if (!bcli)
+		return;
+
+	bcli->pid = pipecmdarr(NULL, &bcli->fd, &bcli->fd,
+			       cast_const2(char **, bcli->args));
+	if (bcli->pid < 0)
+		plugin_err(bcli->cmd->plugin, "%s exec failed: %s",
+			   bcli->args[0], strerror(errno));
+
+	bcli->start = time_now();
+
+	brocoind->num_requests[prio]++;
+
+	/* We don't keep a pointer to this, but it's not a leak */
+	conn = notleak(io_new_conn(bcli, bcli->fd, output_init, bcli));
+	io_set_finish(conn, bcli_finished, bcli);
+
+	list_add_tail(&brocoind->current, &bcli->list);
+	tal_add_destructor(bcli, destroy_bcli);
+}
+
+static void
+start_brocoin_cliv(const tal_t *ctx,
+		   struct command *cmd,
+		   struct command_result *(*process)(struct brocoin_cli *),
+		   bool nonzero_exit_ok,
+		   enum brocoind_prio prio,
+		   void *stash,
+		   const char *method,
+		   va_list ap)
+{
+	struct brocoin_cli *bcli = tal(brocoind, struct brocoin_cli);
+
+	bcli->process = process;
+	bcli->cmd = cmd;
+	bcli->prio = prio;
+
+	if (nonzero_exit_ok)
+		bcli->exitstatus = tal(bcli, int);
+	else
+		bcli->exitstatus = NULL;
+
+	bcli->args = gather_argsv(bcli, method, ap);
+	bcli->stash = stash;
+
+	list_add_tail(&brocoind->pending[bcli->prio], &bcli->list);
+	next_bcli(bcli->prio);
+}
+
+/* If ctx is non-NULL, and is freed before we return, we don't call process().
+ * process returns false() if it's a spurious error, and we should retry. */
+static void LAST_ARG_NULL
+start_brocoin_cli(const tal_t *ctx,
+		  struct command *cmd,
+		  struct command_result *(*process)(struct brocoin_cli *),
+		  bool nonzero_exit_ok,
+		  enum brocoind_prio prio,
+		  void *stash,
+		  const char *method,
+		  ...)
+{
+	va_list ap;
+
+	va_start(ap, method);
+	start_brocoin_cliv(ctx, cmd, process, nonzero_exit_ok, prio, stash, method,
+			   ap);
+	va_end(ap);
+}
+
+static void strip_trailing_whitespace(char *str, size_t len)
+{
+	size_t stripped_len = len;
+	while (stripped_len > 0 && cisspace(str[stripped_len-1]))
+		stripped_len--;
+
+	str[stripped_len] = 0x00;
+}
+
+static struct command_result *command_err_bcli_badjson(struct brocoin_cli *bcli,
+						       const char *errmsg)
+{
+	char *err = tal_fmt(bcli, "%s: bad JSON: %s (%.*s)",
+			    bcli_args(bcli), errmsg,
+			    (int)bcli->output_bytes, bcli->output);
+	return command_done_err(bcli->cmd, BCLI_ERROR, err, NULL);
+}
+
+static struct command_result *process_getutxout(struct brocoin_cli *bcli)
+{
+	const jsmntok_t *tokens;
+	struct json_stream *response;
+	struct brocoin_tx_output output;
+	const char *err;
+
+	/* As of at least v0.15.1.0, brocoind returns "success" but an empty
+	   string on a spent txout. */
+	if (*bcli->exitstatus != 0 || bcli->output_bytes == 0) {
+		response = jsonrpc_stream_success(bcli->cmd);
+		json_add_null(response, "amount");
+		json_add_null(response, "script");
+
+		return command_finished(bcli->cmd, response);
+	}
+
+	tokens = json_parse_simple(bcli->output, bcli->output,
+				   bcli->output_bytes);
+	if (!tokens) {
+		return command_err_bcli_badjson(bcli, "cannot parse");
+	}
+
+	err = json_scan(tmpctx, bcli->output, tokens,
+		       "{value:%,scriptPubKey:{hex:%}}",
+		       JSON_SCAN(json_to_brocoin_amount,
+				 &output.amount.broneess), /* Raw: brocoind */
+		       JSON_SCAN_TAL(bcli, json_tok_bin_from_hex,
+				     &output.script));
+	if (err)
+		return command_err_bcli_badjson(bcli, err);
+
+	response = jsonrpc_stream_success(bcli->cmd);
+	json_add_amount_bro_only(response, "amount", output.amount);
+	json_add_string(response, "script", tal_hex(response, output.script));
+
+	return command_finished(bcli->cmd, response);
+}
+
+static struct command_result *process_getblockchaininfo(struct brocoin_cli *bcli)
+{
+	const jsmntok_t *tokens;
+	struct json_stream *response;
+	bool ibd;
+	u32 headers, blocks;
+	const char *chain, *err;
+
+	tokens = json_parse_simple(bcli->output,
+				   bcli->output, bcli->output_bytes);
+	if (!tokens) {
+		return command_err_bcli_badjson(bcli, "cannot parse");
+	}
+
+	err = json_scan(tmpctx, bcli->output, tokens,
+			"{chain:%,headers:%,blocks:%,initialblockdownload:%}",
+			JSON_SCAN_TAL(tmpctx, json_strdup, &chain),
+			JSON_SCAN(json_to_number, &headers),
+			JSON_SCAN(json_to_number, &blocks),
+			JSON_SCAN(json_to_bool, &ibd));
+	if (err)
+		return command_err_bcli_badjson(bcli, err);
+
+	response = jsonrpc_stream_success(bcli->cmd);
+	json_add_string(response, "chain", chain);
+	json_add_u32(response, "headercount", headers);
+	json_add_u32(response, "blockcount", blocks);
+	json_add_bool(response, "ibd", ibd);
+
+	return command_finished(bcli->cmd, response);
+}
+
+enum feerate_levels {
+	FEERATE_HIGHEST,
+	FEERATE_URGENT,
+	FEERATE_NORMAL,
+	FEERATE_SLOW,
+};
+#define FEERATE_LEVEL_MAX (FEERATE_SLOW)
+
+struct estimatefees_stash {
+	u32 cursor;
+	/* FIXME: We use u64 but lightningd will store them as u32. */
+	u64 perkb[FEERATE_LEVEL_MAX+1];
+};
+
+static struct command_result *
+estimatefees_null_response(struct brocoin_cli *bcli)
+{
+	struct json_stream *response = jsonrpc_stream_success(bcli->cmd);
+
+	json_add_null(response, "opening");
+	json_add_null(response, "mutual_close");
+	json_add_null(response, "unilateral_close");
+	json_add_null(response, "delayed_to_us");
+	json_add_null(response, "htlc_resolution");
+	json_add_null(response, "penalty");
+	json_add_null(response, "min_acceptable");
+	json_add_null(response, "max_acceptable");
+
+	return command_finished(bcli->cmd, response);
+}
+
+static struct command_result *
+estimatefees_parse_feerate(struct brocoin_cli *bcli, u64 *feerate)
+{
+	const jsmntok_t *tokens;
+
+	tokens = json_parse_simple(bcli->output,
+				   bcli->output, bcli->output_bytes);
+	if (!tokens) {
+		return command_err_bcli_badjson(bcli, "cannot parse");
+	}
+
+	if (json_scan(tmpctx, bcli->output, tokens, "{feerate:%}",
+		      JSON_SCAN(json_to_brocoin_amount, feerate)) != NULL) {
+		/* Paranoia: if it had a feerate, but was malformed: */
+		if (json_get_member(bcli->output, tokens, "feerate"))
+			return command_err_bcli_badjson(bcli, "cannot scan");
+		/* Regtest fee estimation is generally awful: Fake it at min. */
+		if (brocoind->fake_fees) {
+			*feerate = 1000;
+			return NULL;
+		}
+		/* We return null if estimation failed, and brocoin-cli will
+		 * exit with 0 but no feerate field on failure. */
+		return estimatefees_null_response(bcli);
+	}
+
+	return NULL;
+}
+
+static struct command_result *process_sendrawtransaction(struct brocoin_cli *bcli)
+{
+	struct json_stream *response;
+
+	/* This is useful for functional tests. */
+	if (bcli->exitstatus)
+		plugin_log(bcli->cmd->plugin, LOG_DBG,
+			   "sendrawtx exit %i (%s) %.*s",
+			   *bcli->exitstatus, bcli_args(bcli),
+			   *bcli->exitstatus ?
+				(u32)bcli->output_bytes-1 : 0,
+				bcli->output);
+
+	response = jsonrpc_stream_success(bcli->cmd);
+	json_add_bool(response, "success",
+		      *bcli->exitstatus == 0 ||
+			  *bcli->exitstatus ==
+			      RPC_TRANSACTION_ALREADY_IN_CHAIN);
+	json_add_string(response, "errmsg",
+			*bcli->exitstatus ?
+			tal_strndup(bcli->cmd,
+				    bcli->output, bcli->output_bytes-1)
+			: "");
+
+	return command_finished(bcli->cmd, response);
+}
+
+struct getrawblock_stash {
+	const char *block_hash;
+	u32 block_height;
+	const char *block_hex;
+};
+
+static struct command_result *process_getrawblock(struct brocoin_cli *bcli)
+{
+	struct json_stream *response;
+	struct getrawblock_stash *stash = bcli->stash;
+
+	strip_trailing_whitespace(bcli->output, bcli->output_bytes);
+	stash->block_hex = tal_steal(stash, bcli->output);
+
+	response = jsonrpc_stream_success(bcli->cmd);
+	json_add_string(response, "blockhash", stash->block_hash);
+	json_add_string(response, "block", stash->block_hex);
+
+	return command_finished(bcli->cmd, response);
+}
+
+static struct command_result *
+getrawblockbyheight_notfound(struct brocoin_cli *bcli)
+{
+	struct json_stream *response;
+
+	response = jsonrpc_stream_success(bcli->cmd);
+	json_add_null(response, "blockhash");
+	json_add_null(response, "block");
+
+	return command_finished(bcli->cmd, response);
+}
+
+static struct command_result *process_getblockhash(struct brocoin_cli *bcli)
+{
+	struct getrawblock_stash *stash = bcli->stash;
+
+	/* If it failed with error 8, give an empty response. */
+	if (bcli->exitstatus && *bcli->exitstatus != 0) {
+		/* Other error means we have to retry. */
+		if (*bcli->exitstatus != 8)
+			return NULL;
+		return getrawblockbyheight_notfound(bcli);
+	}
+
+	strip_trailing_whitespace(bcli->output, bcli->output_bytes);
+	stash->block_hash = tal_strdup(stash, bcli->output);
+	if (!stash->block_hash || strlen(stash->block_hash) != 64) {
+		return command_err_bcli_badjson(bcli, "bad blockhash");
+	}
+
+	start_brocoin_cli(NULL, bcli->cmd, process_getrawblock, false,
+			  BROCOIND_HIGH_PRIO, stash,
+			  "getblock",
+			  stash->block_hash,
+			  /* Non-verbose: raw block. */
+			  "0",
+			  NULL);
+
+	return command_still_pending(bcli->cmd);
+}
+
+/* Get a raw block given its height.
+ * Calls `getblockhash` then `getblock` to retrieve it from brocoin_cli.
+ * Will return early with null fields if block isn't known (yet).
+ */
+static struct command_result *getrawblockbyheight(struct command *cmd,
+                                                  const char *buf,
+                                                  const jsmntok_t *toks)
+{
+	struct getrawblock_stash *stash;
+	u32 *height;
+
+	/* brocoin-cli wants a string. */
+	if (!param(cmd, buf, toks,
+	           p_req("height", param_number, &height),
+	           NULL))
+		return command_param_failed();
+
+	stash = tal(cmd, struct getrawblock_stash);
+	stash->block_height = *height;
+	tal_free(height);
+
+	start_brocoin_cli(NULL, cmd, process_getblockhash, true,
+			  BROCOIND_LOW_PRIO, stash,
+			  "getblockhash",
+			  take(tal_fmt(NULL, "%u", stash->block_height)),
+			  NULL);
+
+	return command_still_pending(cmd);
+}
+
+/* Get infos about the block chain.
+ * Calls `getblockchaininfo` and returns headers count, blocks count,
+ * the chain id, and whether this is initialblockdownload.
+ */
+static struct command_result *getchaininfo(struct command *cmd,
+                                           const char *buf UNUSED,
+                                           const jsmntok_t *toks UNUSED)
+{
+	if (!param(cmd, buf, toks, NULL))
+		return command_param_failed();
+
+	start_brocoin_cli(NULL, cmd, process_getblockchaininfo, false,
+			  BROCOIND_HIGH_PRIO, NULL,
+			  "getblockchaininfo", NULL);
+
+	return command_still_pending(cmd);
+}
+
+/* Mutual recursion. */
+static struct command_result *estimatefees_done(struct brocoin_cli *bcli);
+
+struct estimatefee_params {
+	u32 blocks;
+	const char *style;
+};
+
+static const struct estimatefee_params estimatefee_params[] = {
+	[FEERATE_HIGHEST] = { 2, "CONSERVATIVE" },
+	[FEERATE_URGENT] = { 6, "ECONOMICAL" },
+	[FEERATE_NORMAL] = { 12, "ECONOMICAL" },
+	[FEERATE_SLOW] = { 100, "ECONOMICAL" },
+};
+
+static struct command_result *estimatefees_next(struct command *cmd,
+						struct estimatefees_stash *stash)
+{
+	struct json_stream *response;
+
+	if (stash->cursor < ARRAY_SIZE(stash->perkb)) {
+		start_brocoin_cli(NULL, cmd, estimatefees_done, true,
+				  BROCOIND_LOW_PRIO, stash,
+				  "estimatesmartfee",
+				  take(tal_fmt(NULL, "%u",
+					       estimatefee_params[stash->cursor].blocks)),
+				  estimatefee_params[stash->cursor].style,
+				  NULL);
+
+		return command_still_pending(cmd);
+	}
+
+	response = jsonrpc_stream_success(cmd);
+	json_add_u64(response, "opening", stash->perkb[FEERATE_NORMAL]);
+	json_add_u64(response, "mutual_close", stash->perkb[FEERATE_SLOW]);
+	json_add_u64(response, "unilateral_close",
+		     stash->perkb[FEERATE_URGENT] * brocoind->commit_fee_percent / 100);
+	json_add_u64(response, "delayed_to_us", stash->perkb[FEERATE_NORMAL]);
+	json_add_u64(response, "htlc_resolution", stash->perkb[FEERATE_URGENT]);
+	json_add_u64(response, "penalty", stash->perkb[FEERATE_NORMAL]);
+	/* We divide the slow feerate for the minimum acceptable, lightningd
+	 * will use floor if it's hit, though. */
+	json_add_u64(response, "min_acceptable",
+		     stash->perkb[FEERATE_SLOW] / 2);
+	/* BOLT #2:
+	 *
+	 * Given the variance in fees, and the fact that the transaction may be
+	 * spent in the future, it's a good idea for the fee payer to keep a good
+	 * margin (say 5x the expected fee requirement)
+	 */
+	json_add_u64(response, "max_acceptable",
+		     stash->perkb[FEERATE_HIGHEST]
+		     * brocoind->max_fee_multiplier);
+	return command_finished(cmd, response);
+}
+
+/* Get the current feerates. We use an urgent feerate for unilateral_close and max,
+ * a slightly less urgent feerate for htlc_resolution and penalty transactions,
+ * a slow feerate for min, and a normal one for all others.
+ */
+static struct command_result *estimatefees(struct command *cmd,
+					   const char *buf UNUSED,
+					   const jsmntok_t *toks UNUSED)
+{
+	struct estimatefees_stash *stash = tal(cmd, struct estimatefees_stash);
+
+	if (!param(cmd, buf, toks, NULL))
+		return command_param_failed();
+
+	stash->cursor = 0;
+	return estimatefees_next(cmd, stash);
+}
+
+static struct command_result *estimatefees_done(struct brocoin_cli *bcli)
+{
+	struct command_result *err;
+	struct estimatefees_stash *stash = bcli->stash;
+
+	/* If we cannot estimate fees, no need to continue bothering brocoind. */
+	if (*bcli->exitstatus != 0)
+		return estimatefees_null_response(bcli);
+
+	err = estimatefees_parse_feerate(bcli, &stash->perkb[stash->cursor]);
+	if (err)
+		return err;
+
+	stash->cursor++;
+	return estimatefees_next(bcli->cmd, stash);
+}
+
+/* Send a transaction to the Brocoin network.
+ * Calls `sendrawtransaction` using the first parameter as the raw tx.
+ */
+static struct command_result *sendrawtransaction(struct command *cmd,
+                                                 const char *buf,
+                                                 const jsmntok_t *toks)
+{
+	const char *tx, *highfeesarg;
+	bool *allowhighfees;
+
+	/* brocoin-cli wants strings. */
+	if (!param(cmd, buf, toks,
+	           p_req("tx", param_string, &tx),
+		   p_req("allowhighfees", param_bool, &allowhighfees),
+	           NULL))
+		return command_param_failed();
+
+	if (*allowhighfees) {
+		if (brocoind->version >= 190001)
+			/* Starting in 19.0.1, second argument is
+			 * maxfeerate, which when set to 0 means
+			 * no max feerate.
+			 */
+			highfeesarg = "0";
+		else
+			/* in older versions, second arg is allowhighfees,
+			 * set to true to allow high fees.
+			 */
+			highfeesarg = "true";
+	} else
+		highfeesarg = NULL;
+
+	/* Keep memleak happy! */
+	tal_free(allowhighfees);
+
+	start_brocoin_cli(NULL, cmd, process_sendrawtransaction, true,
+			  BROCOIND_HIGH_PRIO, NULL,
+			  "sendrawtransaction",
+			  tx, highfeesarg, NULL);
+
+	return command_still_pending(cmd);
+}
+
+static struct command_result *getutxout(struct command *cmd,
+                                       const char *buf,
+                                       const jsmntok_t *toks)
+{
+	const char *txid, *vout;
+
+	/* brocoin-cli wants strings. */
+	if (!param(cmd, buf, toks,
+	           p_req("txid", param_string, &txid),
+	           p_req("vout", param_string, &vout),
+	           NULL))
+		return command_param_failed();
+
+	start_brocoin_cli(NULL, cmd, process_getutxout, true,
+			  BROCOIND_HIGH_PRIO, NULL,
+			  "gettxout", txid, vout, NULL);
+
+	return command_still_pending(cmd);
+}
+
+static void brocoind_failure(struct plugin *p, const char *error_message)
+{
+	const char **cmd = gather_args(brocoind, "echo", NULL);
+	plugin_err(p, "\n%s\n\n"
+		      "Make sure you have brocoind running and that brocoin-cli"
+		      " is able to connect to brocoind.\n\n"
+		      "You can verify that your Brocoin Core installation is"
+		      " ready for use by running:\n\n"
+		      "    $ %s 'hello world'\n", error_message,
+		      args_string(cmd, cmd));
+}
+
+/* Do some sanity checks on brocoind based on the output of `getnetworkinfo`. */
+static void parse_getnetworkinfo_result(struct plugin *p, const char *buf)
+{
+	const jsmntok_t *result;
+	bool tx_relay;
+	u32 min_version = 160000;
+	const char *err;
+
+	result = json_parse_simple(NULL, buf, strlen(buf));
+	if (!result)
+		plugin_err(p, "Invalid response to '%s': '%s'. Can not "
+			      "continue without proceeding to sanity checks.",
+			      gather_args(brocoind, "getnetworkinfo", NULL), buf);
+
+	/* Check that we have a fully-featured `estimatesmartfee`. */
+	err = json_scan(tmpctx, buf, result, "{version:%,localrelay:%}",
+			JSON_SCAN(json_to_u32, &brocoind->version),
+			JSON_SCAN(json_to_bool, &tx_relay));
+	if (err)
+		plugin_err(p, "%s.  Got '%s'. Can not"
+			   " continue without proceeding to sanity checks.",
+			   err,
+			   gather_args(brocoind, "getnetworkinfo", NULL), buf);
+
+	if (brocoind->version < min_version)
+		plugin_err(p, "Unsupported brocoind version %"PRIu32", at least"
+			      " %"PRIu32" required.", brocoind->version, min_version);
+
+	/* We don't support 'blocksonly', as we rely on transaction relay for fee
+	 * estimates. */
+	if (!tx_relay)
+		plugin_err(p, "The 'blocksonly' mode of brocoind, or any option "
+			      "deactivating transaction relay is not supported.");
+
+	tal_free(result);
+}
+
+static void wait_and_check_brocoind(struct plugin *p)
+{
+	int from, status, ret;
+	pid_t child;
+	const char **cmd = gather_args(brocoind, "getnetworkinfo", NULL);
+	bool printed = false;
+	char *output = NULL;
+
+	for (;;) {
+		tal_free(output);
+
+		child = pipecmdarr(NULL, &from, &from, cast_const2(char **,cmd));
+		if (child < 0) {
+			if (errno == ENOENT)
+				brocoind_failure(p, "brocoin-cli not found. Is brocoin-cli "
+						    "(part of Brocoin Core) available in your PATH?");
+			plugin_err(p, "%s exec failed: %s", cmd[0], strerror(errno));
+		}
+
+		output = grab_fd(cmd, from);
+
+		while ((ret = waitpid(child, &status, 0)) < 0 && errno == EINTR);
+		if (ret != child)
+			brocoind_failure(p, tal_fmt(brocoind, "Waiting for %s: %s",
+						    cmd[0], strerror(errno)));
+		if (!WIFEXITED(status))
+			brocoind_failure(p, tal_fmt(brocoind, "Death of %s: signal %i",
+						   cmd[0], WTERMSIG(status)));
+
+		if (WEXITSTATUS(status) == 0)
+			break;
+
+		/* brocoin/src/rpc/protocol.h:
+		 *	RPC_IN_WARMUP = -28, //!< Client still warming up
+		 */
+		if (WEXITSTATUS(status) != 28) {
+			if (WEXITSTATUS(status) == 1)
+				brocoind_failure(p, "Could not connect to brocoind using"
+						    " brocoin-cli. Is brocoind running?");
+			brocoind_failure(p, tal_fmt(brocoind, "%s exited with code %i: %s",
+						    cmd[0], WEXITSTATUS(status), output));
+		}
+
+		if (!printed) {
+			plugin_log(p, LOG_UNUSUAL,
+				   "Waiting for brocoind to warm up...");
+			printed = true;
+		}
+		sleep(1);
+	}
+
+	parse_getnetworkinfo_result(p, output);
+
+	tal_free(cmd);
+}
+
+#if DEVELOPER
+static void memleak_mark_brocoind(struct plugin *p, struct htable *memtable)
+{
+	memleak_remove_region(memtable, brocoind, sizeof(*brocoind));
+}
+#endif
+
+static const char *init(struct plugin *p, const char *buffer UNUSED,
+			const jsmntok_t *config UNUSED)
+{
+	wait_and_check_brocoind(p);
+
+	/* Usually we fake up fees in regtest */
+	if (streq(chainparams->network_name, "regtest"))
+		brocoind->fake_fees = IFDEV(!brocoind->no_fake_fees, true);
+	else
+		brocoind->fake_fees = false;
+
+#if DEVELOPER
+	plugin_set_memleak_handler(p, memleak_mark_brocoind);
+#endif
+	plugin_log(p, LOG_INFORM,
+		   "brocoin-cli initialized and connected to brocoind.");
+
+	return NULL;
+}
+
+static const struct plugin_command commands[] = {
+	{
+		"getrawblockbyheight",
+		"brocoin",
+		"Get the brocoin block at a given height",
+		"",
+		getrawblockbyheight
+	},
+	{
+		"getchaininfo",
+		"brocoin",
+		"Get the chain id, the header count, the block count,"
+		" and whether this is IBD.",
+		"",
+		getchaininfo
+	},
+	{
+		"estimatefees",
+		"brocoin",
+		"Get the urgent, normal and slow Brocoin feerates as"
+		" bro/kVB.",
+		"",
+		estimatefees
+	},
+	{
+		"sendrawtransaction",
+		"brocoin",
+		"Send a raw transaction to the Brocoin network.",
+		"",
+		sendrawtransaction
+	},
+	{
+		"getutxout",
+		"brocoin",
+		"Get information about an output, identified by a {txid} an a {vout}",
+		"",
+		getutxout
+	},
+};
+
+static struct brocoind *new_brocoind(const tal_t *ctx)
+{
+	brocoind = tal(ctx, struct brocoind);
+
+	brocoind->cli = NULL;
+	brocoind->datadir = NULL;
+	for (size_t i = 0; i < BROCOIND_NUM_PRIO; i++) {
+		brocoind->num_requests[i] = 0;
+		list_head_init(&brocoind->pending[i]);
+	}
+	list_head_init(&brocoind->current);
+	brocoind->error_count = 0;
+	brocoind->retry_timeout = 60;
+	brocoind->rpcuser = NULL;
+	brocoind->rpcpass = NULL;
+	brocoind->rpcconnect = NULL;
+	brocoind->rpcport = NULL;
+	brocoind->max_fee_multiplier = 10;
+	brocoind->commit_fee_percent = 100;
+#if DEVELOPER
+	brocoind->no_fake_fees = false;
+#endif
+
+	return brocoind;
+}
+
+int main(int argc, char *argv[])
+{
+	setup_locale();
+
+	/* Initialize our global context object here to handle startup options. */
+	brocoind = new_brocoind(NULL);
+
+	plugin_main(argv, init, PLUGIN_STATIC, false /* Do not init RPC on startup*/,
+		    NULL, commands, ARRAY_SIZE(commands),
+		    NULL, 0, NULL, 0, NULL, 0,
+		    plugin_option("brocoin-datadir",
+				  "string",
+				  "-datadir arg for brocoin-cli",
+				  charp_option, &brocoind->datadir),
+		    plugin_option("brocoin-cli",
+				  "string",
+				  "brocoin-cli pathname",
+				  charp_option, &brocoind->cli),
+		    plugin_option("brocoin-rpcuser",
+				  "string",
+				  "brocoind RPC username",
+				  charp_option, &brocoind->rpcuser),
+		    plugin_option("brocoin-rpcpassword",
+				  "string",
+				  "brocoind RPC password",
+				  charp_option, &brocoind->rpcpass),
+		    plugin_option("brocoin-rpcconnect",
+				  "string",
+				  "brocoind RPC host to connect to",
+				  charp_option, &brocoind->rpcconnect),
+		    plugin_option("brocoin-rpcport",
+				  "string",
+				  "brocoind RPC host's port",
+				  charp_option, &brocoind->rpcport),
+		    plugin_option("brocoin-retry-timeout",
+				  "string",
+				  "how long to keep retrying to contact brocoind"
+				  " before fatally exiting",
+				  u64_option, &brocoind->retry_timeout),
+		    plugin_option("commit-fee",
+				  "string",
+				  "Percentage of fee to request for their commitment",
+				  u64_option, &brocoind->commit_fee_percent),
+#if DEVELOPER
+		    plugin_option("dev-max-fee-multiplier",
+				  "string",
+				  "Allow the fee proposed by the remote end to"
+				  " be up to multiplier times higher than our "
+				  "own. Small values will cause channels to be"
+				  " closed more often due to fee fluctuations,"
+				  " large values may result in large fees.",
+				  u32_option, &brocoind->max_fee_multiplier),
+		    plugin_option("dev-no-fake-fees",
+				  "bool",
+				  "Suppress fee faking for regtest",
+				  bool_option, &brocoind->no_fake_fees),
+#endif /* DEVELOPER */
+		    NULL);
+}

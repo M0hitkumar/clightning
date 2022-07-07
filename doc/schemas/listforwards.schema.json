@@ -1,0 +1,244 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "forwards"
+  ],
+  "properties": {
+    "forwards": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+          "in_channel",
+          "in_mbro",
+          "status",
+          "received_time"
+        ],
+        "properties": {
+          "in_channel": {
+            "type": "short_channel_id",
+            "description": "the channel that received the HTLC"
+          },
+          "in_mbronees": {
+            "deprecated": true
+          },
+          "in_mbro": {
+            "type": "mbro",
+            "description": "the value of the incoming HTLC"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "offered",
+              "settled",
+              "local_failed",
+              "failed"
+            ],
+            "description": "still ongoing, completed, failed locally, or failed after forwarding"
+          },
+          "received_time": {
+            "type": "number",
+            "description": "the UNIX timestamp when this was received"
+          },
+          "out_channel": {
+            "type": "short_channel_id",
+            "description": "the channel that the HTLC was forwarded to"
+          },
+          "payment_hash": {
+            "type": "hex",
+            "description": "payment hash sought by HTLC",
+            "maxLength": 64,
+            "minLength": 64
+          },
+          "style": {
+            "type": "string",
+            "enum": [
+              "legacy",
+              "tlv"
+            ],
+            "description": "Either a legacy onion format or a modern tlv format"
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "required": [
+                "out_channel"
+              ]
+            },
+            "then": {
+              "additionalProperties": false,
+              "required": [
+                "fee_mbro",
+                "out_mbro"
+              ],
+              "properties": {
+                "in_channel": {},
+                "in_mbronees": {},
+                "in_mbro": {},
+                "status": {},
+                "style": {},
+                "received_time": {},
+                "resolved_time": {},
+                "out_channel": {},
+                "payment_hash": {},
+                "failcode": {},
+                "failreason": {},
+                "fee": {
+                  "deprecated": true
+                },
+                "fee_mbro": {
+                  "type": "mbro",
+                  "description": "the amount this paid in fees"
+                },
+                "out_mbronees": {
+                  "deprecated": true
+                },
+                "out_mbro": {
+                  "type": "mbro",
+                  "description": "the amount we sent out the *out_channel*"
+                }
+              }
+            },
+            "else": {
+              "additionalProperties": false,
+              "required": [],
+              "properties": {
+                "in_channel": {},
+                "in_mbronees": {},
+                "in_mbro": {},
+                "status": {},
+                "style": {},
+                "received_time": {},
+                "resolved_time": {},
+                "payment_hash": {},
+                "failcode": {},
+                "failreason": {}
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "settled",
+                    "failed"
+                  ]
+                }
+              }
+            },
+            "then": {
+              "additionalProperties": false,
+              "required": [
+                "resolved_time"
+              ],
+              "properties": {
+                "in_channel": {},
+                "in_mbronees": {},
+                "in_mbro": {},
+                "status": {},
+                "style": {},
+                "received_time": {},
+                "out_channel": {},
+                "payment_hash": {},
+                "fee": {},
+                "fee_mbro": {},
+                "out_mbronees": {},
+                "out_mbro": {},
+                "failcode": {},
+                "failreason": {},
+                "resolved_time": {
+                  "type": "number",
+                  "description": "the UNIX timestamp when this was resolved"
+                }
+              }
+            },
+            "else": {
+              "additionalProperties": false,
+              "properties": {
+                "in_channel": {},
+                "in_mbronees": {},
+                "in_mbro": {},
+                "status": {},
+                "style": {},
+                "received_time": {},
+                "out_channel": {},
+                "payment_hash": {},
+                "fee": {},
+                "fee_mbro": {},
+                "failcode": {},
+                "failreason": {},
+                "out_mbronees": {},
+                "out_mbro": {}
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "local_failed",
+                    "failed"
+                  ]
+                }
+              }
+            },
+            "then": {
+              "additionalProperties": false,
+              "required": [],
+              "properties": {
+                "in_channel": {},
+                "in_mbronees": {},
+                "in_mbro": {},
+                "status": {},
+                "style": {},
+                "received_time": {},
+                "out_channel": {},
+                "payment_hash": {},
+                "fee": {},
+                "fee_mbro": {},
+                "out_mbronees": {},
+                "out_mbro": {},
+                "resolved_time": {},
+                "failcode": {
+                  "type": "u32",
+                  "description": "the numeric onion code returned"
+                },
+                "failreason": {
+                  "type": "string",
+                  "description": "the name of the onion code returned"
+                }
+              }
+            },
+            "else": {
+              "additionalProperties": false,
+              "required": [],
+              "properties": {
+                "in_channel": {},
+                "in_mbronees": {},
+                "in_mbro": {},
+                "status": {},
+                "style": {},
+                "received_time": {},
+                "out_channel": {},
+                "payment_hash": {},
+                "fee": {},
+                "fee_mbro": {},
+                "out_mbronees": {},
+                "out_mbro": {},
+                "resolved_time": {}
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}
